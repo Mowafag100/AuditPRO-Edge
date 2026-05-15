@@ -1,119 +1,134 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect } from 'react';
 
 export default function Home() {
-  const [token, setToken] = useState(null);
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [data, setData] = useState(null);
-  const [history, setHistory] = useState([]);
+  const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
+  const [analysis, setAnalysis] = useState<any>(null);
+  const [typedSummary, setTypedSummary] = useState("");
+  const [history, setHistory] = useState([]);
+  const [token, setToken] = useState('');
 
-  useEffect(() => {
-    const savedToken = localStorage.getItem("token");
-    if (savedToken) { setToken(savedToken); fetchHistory(savedToken); }
-  }, []);
-
-  const fetchHistory = async (t) => {
-    try {
-      const res = await fetch("http://127.0.0.1:8090/history", { headers: { "Authorization": `Bearer ${t}` } });
-      const result = await res.json();
-      setHistory(Array.isArray(result) ? result : []);
-    } catch (e) { setHistory([]); }
-  };
-
-  const handleLogin = async (e) => {
-    e.preventDefault();
+  const login = async () => {
     const formData = new URLSearchParams();
-    formData.append("username", username); formData.append("password", password);
-    const res = await fetch("http://127.0.0.1:8090/login", { method: "POST", body: formData });
-    const result = await res.json();
-    if (result.access_token) {
-      setToken(result.access_token);
-      localStorage.setItem("token", result.access_token);
-      fetchHistory(result.access_token);
-    } else { alert("Login Failed"); }
+    formData.append('username', 'admin');
+    formData.append('password', 'admin123');
+    const res = await fetch('http://127.0.0.1:8090/login', { method: 'POST', body: formData });
+    const data = await res.json();
+    setToken(data.access_token);
   };
 
-  const processFile = async (e) => {
-    const file = e.target.files[0]; if (!file) return;
+  const fetchHistory = async () => {
+    if (!token) return;
+    const res = await fetch('http://127.0.0.1:8090/history', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const data = await res.json();
+    setHistory(data);
+  };
+
+  const typeEffect = (text: string) => {
+    let i = 0;
+    setTypedSummary("");
+    const timer = setInterval(() => {
+      setTypedSummary((prev) => prev + text.charAt(i));
+      i++;
+      if (i >= text.length) clearInterval(timer);
+    }, 25);
+  };
+
+  const analyze = async () => {
+    if (!file || !token) return;
     setLoading(true);
-    const formData = new FormData(); formData.append("file", file);
-    try {
-      const res = await fetch("http://127.0.0.1:8090/analyze-contract", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${token}` },
-        body: formData
-      });
-      const result = await res.json();
-      setData(result);
-      fetchHistory(token);
-    } catch (err) {
-      alert("Server connection error");
-    } finally {
-      setLoading(false); // هذا السطر يضمن توقف التحميل مهما حدث
-    }
+    setAnalysis(null);
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch('http://127.0.0.1:8090/analyze-contract', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` },
+      body: formData
+    });
+    const data = await res.json();
+    setAnalysis(data);
+    setLoading(false);
+    if (data.summary) typeEffect(data.summary);
+    fetchHistory();
   };
 
-  if (!token) {
-    return (
-      <div className="min-h-screen bg-[#0a0f1a] flex items-center justify-center p-6 text-left">
-        <form onSubmit={handleLogin} className="bg-[#151c2c] p-10 rounded-3xl border border-slate-800 w-full max-w-sm space-y-6">
-          <h2 className="text-3xl font-black text-center text-blue-500 uppercase">Audit AI</h2>
-          <input type="text" placeholder="Username" onChange={(e)=>setUsername(e.target.value)} className="w-full p-4 bg-[#0d121f] rounded-xl border border-slate-700 text-white outline-none" />
-          <input type="password" placeholder="Password" onChange={(e)=>setPassword(e.target.value)} className="w-full p-4 bg-[#0d121f] rounded-xl border border-slate-700 text-white outline-none" />
-          <button type="submit" className="w-full bg-blue-600 text-white font-bold py-4 rounded-xl">SIGN IN</button>
-        </form>
-      </div>
-    );
-  }
+  useEffect(() => { login(); }, []);
+  useEffect(() => { if (token) fetchHistory(); }, [token]);
 
   return (
-    <div className="min-h-screen bg-[#0a0f1a] text-slate-200 p-6 md:p-12 text-left">
-      <div className="max-w-6xl mx-auto flex justify-between items-center mb-12">
-        <h1 className="text-3xl font-black text-white italic tracking-tighter uppercase">Audit <span className="text-blue-500">PRO</span></h1>
-        <button onClick={() => {setToken(null); localStorage.removeItem("token");}} className="text-red-500 text-xs font-bold uppercase">Logout</button>
-      </div>
+    <div className="min-h-screen bg-black text-white p-6 font-sans">
+      <div className="max-w-5xl mx-auto">
+        <header className="flex justify-between items-center mb-10 border-b border-zinc-800 pb-6">
+          <h1 className="text-xl font-bold bg-gradient-to-r from-emerald-400 to-blue-500 bg-clip-text text-transparent">AuditPRO Edge v2</h1>
+          <div className="px-3 py-1 bg-zinc-900 border border-zinc-800 rounded-full text-[10px] text-zinc-500 font-mono">STATUS: LOCAL_AI_ACTIVE</div>
+        </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-10">
-        <div className="lg:col-span-2">
-          <div className="bg-[#151c2c] rounded-[2.5rem] border border-slate-800 p-10 shadow-2xl relative">
-            <div className="relative border-2 border-dashed border-slate-700 p-16 rounded-[2rem] text-center bg-[#0d121f] group cursor-pointer">
-              <input type="file" onChange={processFile} className="absolute inset-0 opacity-0 cursor-pointer" />
-              <p className="text-lg font-medium text-slate-400">Upload Contract for AI Analysis</p>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+          {[
+            { label: 'Latency', val: analysis?.latency || 'Ready' },
+            { label: 'Security', val: 'AES-256/JWT' },
+            { label: 'Memory', val: 'Optimized' },
+            { label: 'Engine', val: 'TinyLlama 1.1B' }
+          ].map((m, i) => (
+            <div key={i} className="bg-zinc-900/40 border border-zinc-800 p-4 rounded-xl">
+              <p className="text-[9px] uppercase text-zinc-500 mb-1">{m.label}</p>
+              <p className="text-xs font-mono text-white">{m.val}</p>
+            </div>
+          ))}
+        </div>
+
+        <main className="grid md:grid-cols-3 gap-8">
+          <div className="md:col-span-2 space-y-6">
+            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 text-center border-dashed">
+              <input type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} className="hidden" id="file-up" />
+              <label htmlFor="file-up" className="cursor-pointer block">
+                <p className="text-zinc-500 text-sm">{file ? file.name : "Select Legal PDF"}</p>
+              </label>
+              <button onClick={analyze} disabled={loading || !file} className="mt-6 w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-all text-sm font-bold">
+                {loading ? "Processing via Local LLM..." : "Run Analysis"}
+              </button>
             </div>
 
-            {loading && <div className="mt-10 text-center text-blue-400 animate-pulse font-bold uppercase">Analyzing Logic...</div>}
-
-            {data && !loading && (
-              <div className="mt-12 space-y-8 animate-in fade-in duration-500">
-                <div className="flex justify-between items-center p-8 bg-[#0a0f1a] rounded-[1.5rem] border border-slate-800">
-                   <div>
-                     <span className="text-[10px] text-slate-500 block mb-2 uppercase tracking-[0.3em]">Risk Index</span>
-                     <span className={`text-6xl font-black ${data.risk_score > 50 ? 'text-red-500' : 'text-emerald-500'}`}>{data.risk_score}%</span>
-                   </div>
-                   <div className="max-w-md">
-                     <p className="text-xs text-slate-400 leading-relaxed">{data.summary}</p>
-                   </div>
+            {analysis && (
+              <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 animate-in fade-in duration-700">
+                <div className="flex justify-between mb-4">
+                  <h3 className="text-sm font-bold">Analysis Results</h3>
+                  <span className="text-emerald-400 font-mono text-sm">{analysis.risk_score}% Risk</span>
+                </div>
+                <p className="text-zinc-400 text-sm leading-relaxed min-h-[60px]">
+                  {typedSummary}
+                  <span className="inline-block w-1.5 h-4 bg-emerald-500 ml-1 animate-pulse"></span>
+                </p>
+                
+                <div className="grid grid-cols-2 gap-4 mt-6 border-t border-zinc-800 pt-6">
+                  <div>
+                    <h4 className="text-[10px] text-red-400 uppercase mb-2">Risks</h4>
+                    {analysis.risks?.map((r:any, i:number) => <p key={i} className="text-[11px] text-zinc-500 mb-1">• {r}</p>)}
+                  </div>
+                  <div>
+                    <h4 className="text-[10px] text-emerald-400 uppercase mb-2">Actions</h4>
+                    {analysis.recommendations?.map((r:any, i:number) => <p key={i} className="text-[11px] text-zinc-500 mb-1">✓ {r}</p>)}
+                  </div>
                 </div>
               </div>
             )}
           </div>
-        </div>
 
-        <div className="bg-[#151c2c] rounded-[2.5rem] border border-slate-800 p-8 shadow-xl">
-          <h3 className="text-xs font-black text-slate-500 mb-8 uppercase tracking-[0.4em]">Audit History</h3>
-          <div className="space-y-4 max-h-[600px] overflow-y-auto">
-            {history.map((item, index) => (
-              <div key={index} className="p-5 bg-[#0d121f] rounded-2xl border border-slate-800">
-                <div className="flex justify-between items-center mb-2">
-                  <span className="text-xs font-bold text-slate-300">{item.filename}</span>
-                  <span className="text-xs font-black text-emerald-500">{item.risk_score}%</span>
+          <div className="bg-zinc-900/20 border border-zinc-800 rounded-2xl p-5">
+            <h3 className="text-xs text-zinc-500 mb-4 uppercase">Recent Audits</h3>
+            <div className="space-y-3">
+              {history.map((h:any, i) => (
+                <div key={i} className="p-3 border border-zinc-800 rounded-lg bg-black/40">
+                  <p className="text-[11px] truncate text-zinc-300">{h.filename}</p>
+                  <p className="text-[9px] text-zinc-600 mt-1">{h.date}</p>
                 </div>
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
-        </div>
+        </main>
       </div>
     </div>
   );

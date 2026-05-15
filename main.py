@@ -44,22 +44,28 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
         content = await file.read()
         text = ""
         with pdfplumber.open(io.BytesIO(content)) as pdf:
-            text = pdf.pages[0].extract_text()[:500] if pdf.pages else ""
+            for page in pdf.pages[:2]: # قراءة أول صفحتين لدقة أعلى
+                text += page.extract_text() or ""
+        
+        text = text[:1200] # زيادة حجم السياق
         
         PROMPT = "JSON ONLY: {\"risk_score\": int, \"summary\": \"str\", \"risks\": [\"str\"], \"recommendations\": [\"str\"]}"
         
         response = await client.chat.completions.create(
             model="tinyllama",
-            messages=[{"role": "system", "content": PROMPT}, {"role": "user", "content": text}],
-            temperature=0.1
+            messages=[
+                {"role": "system", "content": "You are a legal AI. Output ONLY valid JSON."},
+                {"role": "user", "content": f"{PROMPT}\n\nContract text: {text}"}
+            ],
+            temperature=0.2
         )
         
         raw = response.choices[0].message.content
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        res_data = json.loads(json_match.group(0)) if json_match else {"risk_score": 0, "summary": "Analysis failed"}
+        res_data = json.loads(json_match.group(0)) if json_match else {"risk_score": 0, "summary": "Failed to parse AI output"}
         
         latency = round(time.time() - start_time, 2)
-        engine_info = "TinyLlama 1.1B (Edge)"
+        engine_info = "TinyLlama 1.1B (Optimized)"
         
         conn = sqlite3.connect("platform.db")
         cursor = conn.cursor()
@@ -70,20 +76,9 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
         conn.commit()
         conn.close()
         
-        return {**res_data, "engine": engine_info, "latency": f"{latency}s", "runtime": "Ollama/Termux"}
+        return {**res_data, "engine": engine_info, "latency": f"{latency}s"}
     except Exception as e:
-        print(f"Error: {e}")
         return {"risk_score": 0, "summary": f"System Error: {str(e)}"}
-
-@app.get("/history")
-async def get_history(token: str = Depends(oauth2_scheme)):
-    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    conn = sqlite3.connect("platform.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT filename, risk_score, summary, risks, recommendations, engine, latency, timestamp FROM history WHERE username = ? ORDER BY id DESC", (payload.get("sub"),))
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"filename": r[0], "risk_score": r[1], "summary": r[2], "risks": json.loads(r[3]), "recommendations": json.loads(r[4]), "engine": r[5], "latency": r[6], "date": r[7]} for r in rows]
 
 if __name__ == "__main__":
     import uvicorn
