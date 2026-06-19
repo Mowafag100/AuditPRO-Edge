@@ -148,58 +148,73 @@ def local_security_audit(text: str) -> dict:
         "source": "Local-Audit Engine (TinyLlama 1.1B)"
     }
 
-# --- نقطة النهاية الرئيسية للتحليل ---
+# --- نقطة النهاية الرئيسية للتحليل (مع معالجة الأخطاء الأسطورية) ---
 @app.post("/analyze-contract")
 async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oauth2_scheme)):
     start_time = time.time()
-    
-    # قراءة الملف
-    content = await file.read()
-    # استخراج النص من PDF
-    text = ""
     try:
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-    except Exception as e:
-        logger.error(f"PDF extraction error: {e}")
+        # ----- التحقق من نوع الملف -----
+        if not file.filename.lower().endswith('.pdf'):
+            logger.warning(f"⚠️ Rejected non-PDF file: {file.filename}")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Only PDF files are supported.", "filename": file.filename}
+            )
+
+        # قراءة الملف
+        content = await file.read()
+        # استخراج النص من PDF
         text = ""
-    
-    if not text.strip():
-        logger.warning("⚠️ No text extracted from PDF. Returning local audit.")
-        result = local_security_audit("")
-        result["summary"] = "No readable text found in the PDF document."
-        return {**result, "latency": "0.0s"}
-    
-    logger.info(f"📄 Extracted text length: {len(text)} characters")
-    
-    # محاولة التحليل باستخدام Ollama
-    ollama_result = await audit_with_ollama(text)
-    
-    if ollama_result:
-        result = ollama_result
-        logger.info(f"🤖 Analysis source: {result.get('source')}")
-    else:
-        result = local_security_audit(text)
-        logger.info(f"⚠️ Using fallback: {result.get('source')}")
-    
-    latency = round(time.time() - start_time, 3)
+        try:
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+        except Exception as e:
+            logger.error(f"PDF extraction error: {e}")
+            text = ""
+        
+        if not text.strip():
+            logger.warning("⚠️ No text extracted from PDF. Returning local audit.")
+            result = local_security_audit("")
+            result["summary"] = "No readable text found in the PDF document."
+            latency = round(time.time() - start_time, 3)
+            return {**result, "latency": f"{latency}s"}
+        
+        logger.info(f"📄 Extracted text length: {len(text)} characters")
+        
+        # محاولة التحليل باستخدام Ollama
+        ollama_result = await audit_with_ollama(text)
+        if ollama_result:
+            result = ollama_result
+            logger.info(f"🤖 Analysis source: {result.get('source')}")
+        else:
+            result = local_security_audit(text)
+            logger.info(f"⚠️ Using fallback: {result.get('source')}")
+        
+        latency = round(time.time() - start_time, 3)
 
-    # حفظ في قاعدة البيانات
-    async with async_session() as session:
-        new_log = AuditLog(
-            filename=file.filename,
-            risk_score=result["score"],
-            risk_level=result["risk_level"],
-            summary=result["summary"],
-            latency=latency
+        # حفظ في قاعدة البيانات
+        async with async_session() as session:
+            new_log = AuditLog(
+                filename=file.filename,
+                risk_score=result["score"],
+                risk_level=result["risk_level"],
+                summary=result["summary"],
+                latency=latency
+            )
+            session.add(new_log)
+            await session.commit()
+
+        return {**result, "latency": f"{latency}s"}
+
+    except Exception as e:
+        logger.error(f"🔥 Unhandled error in analyze_contract: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal server error", "details": str(e)}
         )
-        session.add(new_log)
-        await session.commit()
-
-    return {**result, "latency": f"{latency}s"}
 
 if __name__ == "__main__":
     import uvicorn
