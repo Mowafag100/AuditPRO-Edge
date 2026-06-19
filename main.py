@@ -67,6 +67,8 @@ async def get_history():
         result = await session.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(20))
         logs = result.scalars().all()
         return [{"filename": l.filename, "risk_score": l.risk_score, "date": l.created_at.isoformat()} for l in logs]
+
+# --- دالة تحليل باستخدام Ollama (الأسطورية) ---
 async def audit_with_ollama(text: str) -> dict:
     ollama_host = os.getenv("OLLAMA_HOST", settings.OLLAMA_HOST)
     truncated = text[:1500]  # تقليل النص لتسريع المعالجة
@@ -84,7 +86,7 @@ Contract text:
 JSON:"""
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:  # ← مهلة 120 ثانية
+        async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{ollama_host}/api/generate",
                 json={"model": "llama3", "prompt": prompt, "stream": False}
@@ -94,13 +96,13 @@ JSON:"""
                 answer = result.get("response", "")
                 logger.info(f"✅ Ollama raw response: {answer[:200]}...")
                 
-                # استخراج JSON من الرد
+                # --- استخراج JSON من الرد (الجزء المصحح) ---
                 try:
-                    # محاولة استخراج JSON من النص
                     import re
-                    json_match = re.search(r'\{[^{}]*\}', answer, re.DOTALL)
+                    # البحث عن JSON object في النص
+                    json_match = re.search(r'(\{.*\})', answer, re.DOTALL)
                     if json_match:
-                        data = json.loads(json_match.group())
+                        data = json.loads(json_match.group(1))
                         return {
                             "score": data.get("score", 50),
                             "risk_level": data.get("risk_level", "MEDIUM"),
@@ -110,7 +112,6 @@ JSON:"""
                             "source": "Ollama (Llama3)"
                         }
                     else:
-                        # إذا لم نجد JSON، استخدم النص كملخص
                         return {
                             "score": 50,
                             "risk_level": "MEDIUM",
@@ -135,6 +136,7 @@ JSON:"""
     except Exception as e:
         logger.error(f"❌ Ollama connection error: {e}", exc_info=True)
         return None
+
 # --- دالة التحليل المحلية (الاحتياطي) ---
 def local_security_audit(text: str) -> dict:
     return {
@@ -145,6 +147,8 @@ def local_security_audit(text: str) -> dict:
         "recommendations": ["Review by legal counsel."],
         "source": "Local-Audit Engine (TinyLlama 1.1B)"
     }
+
+# --- نقطة النهاية الرئيسية للتحليل ---
 @app.post("/analyze-contract")
 async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oauth2_scheme)):
     start_time = time.time()
@@ -172,7 +176,7 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
     logger.info(f"📄 Extracted text length: {len(text)} characters")
     
     # محاولة التحليل باستخدام Ollama
-    ollama_result = await audit_with_ollama(text)  # ← يجب أن تكون داخل async def analyze_contract
+    ollama_result = await audit_with_ollama(text)
     
     if ollama_result:
         result = ollama_result
