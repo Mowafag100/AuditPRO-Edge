@@ -1,6 +1,9 @@
 "use client";
 import { useState, useEffect } from 'react';
 
+// إعداد الرابط الأساسي للاتصال بالباك إيند
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8090';
+
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
@@ -10,21 +13,32 @@ export default function Home() {
   const [token, setToken] = useState('');
 
   const login = async () => {
-    const formData = new URLSearchParams();
-    formData.append('username', 'admin');
-    formData.append('password', 'admin123');
-    const res = await fetch('http://127.0.0.1:8090/login', { method: 'POST', body: formData });
-    const data = await res.json();
-    setToken(data.access_token);
+    try {
+      const formData = new URLSearchParams();
+      formData.append('username', 'admin');
+      formData.append('password', 'admin123');
+      const res = await fetch(`${API_BASE}/login`, {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      setToken(data.access_token);
+    } catch (error) {
+      console.error("Login Error:", error);
+    }
   };
 
   const fetchHistory = async () => {
     if (!token) return;
-    const res = await fetch('http://127.0.0.1:8090/history', {
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-    const data = await res.json();
-    setHistory(data);
+    try {
+      const res = await fetch(`${API_BASE}/history`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await res.json();
+      setHistory(data);
+    } catch (error) {
+      console.error("History Error:", error);
+    }
   };
 
   const typeEffect = (text: string) => {
@@ -43,16 +57,21 @@ export default function Home() {
     setAnalysis(null);
     const formData = new FormData();
     formData.append('file', file);
-    const res = await fetch('http://127.0.0.1:8090/analyze-contract', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}` },
-      body: formData
-    });
-    const data = await res.json();
-    setAnalysis(data);
-    setLoading(false);
-    if (data.summary) typeEffect(data.summary);
-    fetchHistory();
+    try {
+      const res = await fetch(`${API_BASE}/analyze-contract`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: formData
+      });
+      const data = await res.json();
+      setAnalysis(data);
+      if (data.summary) typeEffect(data.summary);
+      fetchHistory();
+    } catch (error) {
+      console.error("Analysis Error:", error);
+    } finally {
+      setLoading(false);
+    }
   };
 
   useEffect(() => { login(); }, []);
