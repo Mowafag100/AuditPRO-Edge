@@ -13,3 +13,29 @@ __pycache__/
 *.sqlite3
 .pytest_cache/
 node_modules
+# Next.js
+.next/
+out/
+*.log
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# قواعد البيانات المؤقتة
+platform.db
+*.sqlite
+*.sqlite3
+
+# ملفات النظام
+.DS_Store
+Thumbs.db
+
+# ملفات IDE
+.vscode/
+.idea/
+
+# سجلات Docker
+*.log

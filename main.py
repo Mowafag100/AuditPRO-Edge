@@ -1,16 +1,16 @@
 import io, re, jwt, datetime, time, json, hashlib, os, logging
+import httpx
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pdfplumber
-import httpx
 from pydantic_settings import BaseSettings
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, Text, Float, DateTime, select
 
-# --- إعدادات التسجيل الأسطورية ---
+# --- إعدادات التسجيل ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -18,15 +18,15 @@ logger = logging.getLogger(__name__)
 class Settings(BaseSettings):
     SECRET_KEY: str = "my_super_secret_key_123"
     GEMINI_API_KEY: str = "your_gemini_key_here"
-    DATABASE_URL: str = "sqlite+aiosqlite:///./platform.db"
-    OLLAMA_HOST: str = "http://localhost:11434"  # تم التعديل للعمل محلياً
+    DATABASE_URL: str = "sqlite+aiosqlite:///./platform.db"  # نعود إلى SQLite مؤقتاً
+    OLLAMA_HOST: str = "http://ollama:11434"
 
 settings = Settings()
 engine = create_async_engine(settings.DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
-# --- تعريف الجدول ---
+# --- تعريف الجدول (مع إصلاح التاريخ) ---
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id = Column(Integer, primary_key=True, index=True)
@@ -35,11 +35,11 @@ class AuditLog(Base):
     risk_level = Column(String(50))
     summary = Column(Text)
     latency = Column(Float)
-    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.UTC))
+    created_at = Column(DateTime, default=lambda: datetime.datetime.utcnow())  # ← إصلاح التاريخ
 
 app = FastAPI(title="AuditPro Edge Enterprise")
 
-# --- تفعيل الـ CORS ---
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,14 +50,61 @@ app.add_middleware(
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
+# --- دوال ChromaDB عبر HTTP v2 (بدون مكتبة) ---
+async def chromadb_health() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("http://chromadb:8000/api/v2/heartbeat")
+            return resp.status_code == 200
+    except:
+        return False
+
+async def chromadb_query(query: str, n_results: int = 3) -> list:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "http://chromadb:8000/api/v2/collections/contracts/query",
+                json={"query_texts": [query], "n_results": n_results}
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("documents", [[]])[0]
+            return []
+    except Exception as e:
+        logger.error(f"ChromaDB query error: {e}")
+        return []
+
+# --- حدث بدء التشغيل ---
 @app.on_event("startup")
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    
+    # محاولة إنشاء المجموعة في ChromaDB عبر HTTP v2
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # التحقق من الصحة أولاً
+            health = await client.get("http://chromadb:8000/api/v2/heartbeat")
+            if health.status_code == 200:
+                logger.info("✅ ChromaDB is reachable")
+                # إنشاء المجموعة
+                resp = await client.post(
+                    "http://chromadb:8000/api/v2/collections",
+                    json={"name": "contracts"}
+                )
+                if resp.status_code in [200, 201]:
+                    logger.info("✅ ChromaDB collection 'contracts' created")
+                else:
+                    logger.warning(f"⚠️ Collection creation: {resp.status_code} - {resp.text}")
+            else:
+                logger.warning("⚠️ ChromaDB health check failed")
+    except Exception as e:
+        logger.warning(f"⚠️ ChromaDB setup error: {e}")
 
+# --- نقاط النهاية ---
 @app.post("/login")
 async def login():
-    expire = datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=8)
+    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=8)  # ← إصلاح التاريخ
     token = jwt.encode({"sub": "admin", "exp": expire}, settings.SECRET_KEY, algorithm="HS256")
     return {"access_token": token, "token_type": "bearer"}
 
@@ -68,21 +115,35 @@ async def get_history():
         logs = result.scalars().all()
         return [{"filename": l.filename, "risk_score": l.risk_score, "date": l.created_at.isoformat()} for l in logs]
 
-# --- دالة تحليل باستخدام Ollama (الأسطورية) ---
-async def audit_with_ollama(text: str) -> dict:
+# --- دالة تحليل Ollama ---
+async def audit_with_ollama(text: str, context: str = "") -> dict:
     ollama_host = os.getenv("OLLAMA_HOST", settings.OLLAMA_HOST)
-    truncated = text[:1500]  # تقليل النص لتسريع المعالجة
+    truncated = text[:1500]
     
-    prompt = f"""Analyze the following contract and provide ONLY a valid JSON object with these fields:
-- score (0-100, where 0 is highest risk and 100 is lowest)
+    if context:
+        prompt = f"""Context from similar contracts:
+{context}
+
+Analyze the following contract and provide ONLY a valid JSON object with these fields:
+- score (0-100)
 - risk_level (LOW/MEDIUM/HIGH/CRITICAL)
-- summary (brief summary of findings)
-- risks (list of specific risks found)
+- summary (brief summary)
+- risks (list of risks)
 - recommendations (list of recommendations)
 
-Contract text:
+Contract:
 {truncated}
+JSON:"""
+    else:
+        prompt = f"""Analyze the following contract and provide ONLY a valid JSON object with these fields:
+- score (0-100)
+- risk_level (LOW/MEDIUM/HIGH/CRITICAL)
+- summary (brief summary)
+- risks (list of risks)
+- recommendations (list of recommendations)
 
+Contract:
+{truncated}
 JSON:"""
 
     try:
@@ -96,17 +157,14 @@ JSON:"""
                 answer = result.get("response", "")
                 logger.info(f"✅ Ollama raw response: {answer[:200]}...")
                 
-                # --- استخراج JSON من الرد (الجزء المصحح) ---
                 try:
-                    import re
-                    # البحث عن JSON object في النص
                     json_match = re.search(r'(\{.*\})', answer, re.DOTALL)
                     if json_match:
                         data = json.loads(json_match.group(1))
                         return {
                             "score": data.get("score", 50),
                             "risk_level": data.get("risk_level", "MEDIUM"),
-                            "summary": data.get("summary", "No summary provided."),
+                            "summary": data.get("summary", "No summary."),
                             "risks": data.get("risks", []),
                             "recommendations": data.get("recommendations", []),
                             "source": "Ollama (Llama3)"
@@ -117,7 +175,7 @@ JSON:"""
                             "risk_level": "MEDIUM",
                             "summary": answer[:200],
                             "risks": ["Unable to parse structured output."],
-                            "recommendations": ["Check the contract manually."],
+                            "recommendations": ["Check manually."],
                             "source": "Ollama (Llama3) - Raw"
                         }
                 except json.JSONDecodeError as e:
@@ -127,17 +185,17 @@ JSON:"""
                         "risk_level": "MEDIUM",
                         "summary": answer[:200],
                         "risks": ["Unable to parse structured output."],
-                        "recommendations": ["Check the contract manually."],
+                        "recommendations": ["Check manually."],
                         "source": "Ollama (Llama3) - Raw"
                     }
             else:
-                logger.error(f"❌ Ollama returned status {response.status_code}")
+                logger.error(f"❌ Ollama returned {response.status_code}")
                 return None
     except Exception as e:
-        logger.error(f"❌ Ollama connection error: {e}", exc_info=True)
+        logger.error(f"❌ Ollama error: {e}", exc_info=True)
         return None
 
-# --- دالة التحليل المحلية (الاحتياطي) ---
+# --- دالة التحليل المحلية (احتياطي) ---
 def local_security_audit(text: str) -> dict:
     return {
         "score": 45,
@@ -148,22 +206,15 @@ def local_security_audit(text: str) -> dict:
         "source": "Local-Audit Engine (TinyLlama 1.1B)"
     }
 
-# --- نقطة النهاية الرئيسية للتحليل (مع معالجة الأخطاء الأسطورية) ---
+# --- نقطة النهاية الرئيسية ---
 @app.post("/analyze-contract")
 async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oauth2_scheme)):
     start_time = time.time()
     try:
-        # ----- التحقق من نوع الملف -----
         if not file.filename.lower().endswith('.pdf'):
-            logger.warning(f"⚠️ Rejected non-PDF file: {file.filename}")
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Only PDF files are supported.", "filename": file.filename}
-            )
+            return JSONResponse(status_code=400, content={"error": "Only PDF files are supported."})
 
-        # قراءة الملف
         content = await file.read()
-        # استخراج النص من PDF
         text = ""
         try:
             with pdfplumber.open(io.BytesIO(content)) as pdf:
@@ -174,25 +225,27 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
         except Exception as e:
             logger.error(f"PDF extraction error: {e}")
             text = ""
-        
+
         if not text.strip():
-            logger.warning("⚠️ No text extracted from PDF. Returning local audit.")
             result = local_security_audit("")
-            result["summary"] = "No readable text found in the PDF document."
-            latency = round(time.time() - start_time, 3)
-            return {**result, "latency": f"{latency}s"}
-        
+            result["summary"] = "No readable text found."
+            return {**result, "latency": "0.0s"}
+
         logger.info(f"📄 Extracted text length: {len(text)} characters")
-        
-        # محاولة التحليل باستخدام Ollama
-        ollama_result = await audit_with_ollama(text)
+
+        # استرجاع سياق من ChromaDB
+        context = await chromadb_query(text, n_results=2)
+        context_str = "\n".join(context) if context else ""
+
+        # التحليل باستخدام Ollama
+        ollama_result = await audit_with_ollama(text, context_str)
         if ollama_result:
             result = ollama_result
             logger.info(f"🤖 Analysis source: {result.get('source')}")
         else:
             result = local_security_audit(text)
-            logger.info(f"⚠️ Using fallback: {result.get('source')}")
-        
+            logger.info(f"⚠️ Using fallback")
+
         latency = round(time.time() - start_time, 3)
 
         # حفظ في قاعدة البيانات
@@ -203,6 +256,7 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
                 risk_level=result["risk_level"],
                 summary=result["summary"],
                 latency=latency
+                # created_at سيتم تعيينها تلقائياً بواسطة default
             )
             session.add(new_log)
             await session.commit()
@@ -210,11 +264,8 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
         return {**result, "latency": f"{latency}s"}
 
     except Exception as e:
-        logger.error(f"🔥 Unhandled error in analyze_contract: {e}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Internal server error", "details": str(e)}
-        )
+        logger.error(f"🔥 Unhandled error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "Internal server error", "details": str(e)})
 
 if __name__ == "__main__":
     import uvicorn

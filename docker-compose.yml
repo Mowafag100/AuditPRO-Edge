@@ -1,4 +1,7 @@
 services:
+  # ============================================
+  # 1. الذكاء الاصطناعي المحلي (Ollama)
+  # ============================================
   ollama:
     image: ollama/ollama:latest
     ports:
@@ -6,32 +9,84 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     restart: unless-stopped
-    command: serve --host 0.0.0.0   # هذه هي الصيغة الصحيحة لبعض الإصدارات
-    # إذا لم يعمل --host، جرب --listen 0.0.0.0               # ← بدون أي خيارات إضافية
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    command: serve
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
+    networks:
+      - audit_network
 
-  # ── الخلفية (FastAPI) ──
+  # ============================================
+  # 2. قاعدة البيانات العلائقية (PostgreSQL)
+  # ============================================
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: audituser
+      POSTGRES_PASSWORD: securepassword123
+      POSTGRES_DB: auditpro
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U audituser -d auditpro"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - audit_network
+    restart: unless-stopped
+
+  # ============================================
+  # 3. قاعدة بيانات المتجهات (ChromaDB) – RAG
+  # ============================================
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8000/api/v2/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    networks:
+      - audit_network
+    restart: unless-stopped
+
+  # ============================================
+  # 4. الخلفية (FastAPI) – مع دعم PostgreSQL و ChromaDB
+  # ============================================
   backend:
     build: .
     ports:
       - "8090:8090"
     environment:
-      - OLLAMA_HOST=http://ollama:11434   # ← الاتصال عبر اسم الخدمة
+      - OLLAMA_HOST=http://ollama:11434
       - SECRET_KEY=my_super_secret_key_123
       - GEMINI_API_KEY=your_gemini_key_here
-      - DATABASE_URL=sqlite+aiosqlite:///./platform.db
+      - DATABASE_URL=postgresql+asyncpg://audituser:securepassword123@postgres:5432/auditpro
       - REDIS_URL=redis://redis:6379
+      - CHROMA_HOST=http://chromadb:8000
     depends_on:
       - ollama
+      - postgres
       - redis
+      - chromadb
     volumes:
       - .:/app
-      - ./platform.db:/app/platform.db
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -40,8 +95,13 @@ services:
       timeout: 10s
       retries: 5
       start_period: 15s
+    networks:
+      - audit_network
+    restart: unless-stopped
 
-  # ── الواجهة الأمامية (Next.js) ──
+  # ============================================
+  # 5. الواجهة الأمامية (Next.js)
+  # ============================================
   frontend:
     image: node:22-slim
     working_dir: /app
@@ -60,8 +120,13 @@ services:
       timeout: 10s
       retries: 5
       start_period: 15s
+    networks:
+      - audit_network
+    restart: unless-stopped
 
-  # ── قاعدة بيانات مؤقتة (Redis) ──
+  # ============================================
+  # 6. Redis – تخزين مؤقت (جلسات، مهام)
+  # ============================================
   redis:
     image: redis:alpine
     ports:
@@ -72,6 +137,21 @@ services:
       timeout: 10s
       retries: 5
       start_period: 10s
+    networks:
+      - audit_network
+    restart: unless-stopped
 
+# ============================================
+# الشبكة المخصصة لعزل الخدمات
+# ============================================
+networks:
+  audit_network:
+    driver: bridge
+
+# ============================================
+# وحدات التخزين الدائمة
+# ============================================
 volumes:
   ollama_data:
+  postgres_data:
+  chromadb_data:
