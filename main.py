@@ -4,13 +4,14 @@ import httpx
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import pdfplumber
 from pydantic_settings import BaseSettings
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, Text, Float, DateTime, select
 from src.logging_config import configure_logging
+from prometheus_client import Counter, Histogram, generate_latest, REGISTRY
 
 # --- إعدادات التسجيل المنظم ---
 configure_logging()
@@ -21,7 +22,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "my_super_secret_key_123"
     GEMINI_API_KEY: str = "your_gemini_key_here"
     DATABASE_URL: str = "sqlite+aiosqlite:///./platform.db"
-    OLLAMA_HOST: str = "http://localhost:11434"  # تم التعديل للعمل محلياً
+    OLLAMA_HOST: str = "http://localhost:11434"
 
 settings = Settings()
 engine = create_async_engine(settings.DATABASE_URL, echo=False)
@@ -50,6 +51,24 @@ app.add_middleware(
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
+# ============================================
+# مقاييس Prometheus للمراقبة
+# ============================================
+REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status'])
+REQUEST_LATENCY = Histogram('http_request_duration_seconds', 'HTTP request latency', ['method', 'endpoint'])
+ERROR_COUNT = Counter('http_errors_total', 'Total HTTP errors', ['method', 'endpoint', 'error_type'])
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path, status=response.status_code).inc()
+    REQUEST_LATENCY.labels(method=request.method, endpoint=request.url.path).observe(duration)
+    if response.status_code >= 400:
+        ERROR_COUNT.labels(method=request.method, endpoint=request.url.path, error_type=str(response.status_code)).inc()
+    return response
+
 # --- دوال ChromaDB ---
 async def chromadb_health() -> bool:
     try:
@@ -72,7 +91,7 @@ async def chromadb_query(query: str, n_results: int = 3) -> list:
                 return data.get("documents", [[]])[0]
             return []
     except Exception as e:
-        logger.error("chromadb_query_error", error=str(e))
+        logger.error("chromadb_query_error", error=repr(e), type=type(e).__name__)
         return []
 
 # --- حدث بدء التشغيل ---
@@ -257,6 +276,46 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
     except Exception as e:
         logger.error("unhandled_exception", error=str(e), exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Internal server error", "details": str(e)})
+
+# ============================================
+# نقاط النهاية للمراقبة (Monitoring)
+# ============================================
+@app.get("/health")
+async def health_check():
+    """التحقق من صحة الخدمات الأساسية"""
+    status = {"status": "healthy", "services": {}}
+    
+    try:
+        chroma_ok = await chromadb_health()
+        status["services"]["chromadb"] = "up" if chroma_ok else "down"
+    except:
+        status["services"]["chromadb"] = "down"
+    
+    try:
+        async with async_session() as session:
+            await session.execute("SELECT 1")
+        status["services"]["database"] = "up"
+    except:
+        status["services"]["database"] = "down"
+    
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get("http://localhost:11434/api/tags")
+            status["services"]["ollama"] = "up" if resp.status_code == 200 else "down"
+    except:
+        status["services"]["ollama"] = "down"
+    
+    if all(v == "up" for v in status["services"].values()):
+        status["status"] = "healthy"
+        return JSONResponse(content=status, status_code=200)
+    else:
+        status["status"] = "unhealthy"
+        return JSONResponse(content=status, status_code=503)
+
+@app.get("/metrics")
+async def metrics():
+    """نقطة نهاية لمقاييس Prometheus"""
+    return Response(content=generate_latest(REGISTRY), media_type="text/plain")
 
 if __name__ == "__main__":
     import uvicorn
