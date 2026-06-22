@@ -79,7 +79,7 @@ services:
       - GEMINI_API_KEY=your_gemini_key_here
       - DATABASE_URL=postgresql+asyncpg://audituser:securepassword123@postgres:5432/auditpro
       - REDIS_URL=redis://redis:6379
-      - CHROMA_HOST=http://chromadb:8000
+      - CHROMA_HOST=http://localhost:8000
     depends_on:
       - ollama
       - postgres
