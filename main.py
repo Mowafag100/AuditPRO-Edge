@@ -5,6 +5,7 @@ from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi import Form
 import pdfplumber
 from pydantic_settings import BaseSettings
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -37,7 +38,7 @@ class AuditLog(Base):
     risk_level = Column(String(50))
     summary = Column(Text)
     latency = Column(Float)
-    created_at = Column(DateTime, default=lambda: datetime.datetime.utcnow())
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
 
 app = FastAPI(title="AuditPro Edge Enterprise")
 
@@ -69,11 +70,11 @@ async def metrics_middleware(request: Request, call_next):
         ERROR_COUNT.labels(method=request.method, endpoint=request.url.path, error_type=str(response.status_code)).inc()
     return response
 
-# --- دوال ChromaDB ---
+# --- دوال ChromaDB (API v1) ---
 async def chromadb_health() -> bool:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get("http://chromadb:8000/api/v2/heartbeat")
+            resp = await client.get("http://localhost:8000/api/v1/heartbeat")
             return resp.status_code == 200
     except Exception as e:
         logger.error("chromadb_health_check_failed", error=str(e))
@@ -83,7 +84,7 @@ async def chromadb_query(query: str, n_results: int = 3) -> list:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                "http://chromadb:8000/api/v2/collections/contracts/query",
+                "http://localhost:8000/api/v1/collections/contracts/query",
                 json={"query_texts": [query], "n_results": n_results}
             )
             if resp.status_code == 200:
@@ -102,11 +103,11 @@ async def startup():
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            health = await client.get("http://chromadb:8000/api/v2/heartbeat")
+            health = await client.get("http://localhost:8000/api/v1/heartbeat")
             if health.status_code == 200:
                 logger.info("chromadb_health_check", status="reachable")
                 resp = await client.post(
-                    "http://chromadb:8000/api/v2/collections",
+                    "http://localhost:8000/api/v1/collections",
                     json={"name": "contracts"}
                 )
                 if resp.status_code in [200, 201]:
@@ -121,7 +122,7 @@ async def startup():
 # --- نقاط النهاية ---
 @app.post("/login")
 async def login():
-    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     token = jwt.encode({"sub": "admin", "exp": expire}, settings.SECRET_KEY, algorithm="HS256")
     return {"access_token": token, "token_type": "bearer"}
 
@@ -317,6 +318,61 @@ async def metrics():
     """نقطة نهاية لمقاييس Prometheus"""
     return Response(content=generate_latest(REGISTRY), media_type="text/plain")
 
+@app.post("/evaluate")
+async def evaluate_contract(
+    file: UploadFile = File(...),
+    reference_text: str = Form(...),  # النص المرجعي للمقارنة
+    token: str = Depends(oauth2_scheme)
+):
+    """
+    تحليل عقد وتقييم جودة المخرجات مقارنة بنص مرجعي.
+    """
+    start_time = time.time()
+    try:
+        if not file.filename.lower().endswith('.pdf'):
+            return JSONResponse(status_code=400, content={"error": "Only PDF files are supported."})
+
+        content = await file.read()
+        text = ""
+        try:
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+        except Exception as e:
+            logger.error("pdf_extraction_error", error=str(e))
+            return JSONResponse(status_code=400, content={"error": "Failed to extract text from PDF."})
+
+        if not text.strip():
+            return JSONResponse(status_code=400, content={"error": "No text found in PDF."})
+
+        # استرجاع السياق من ChromaDB (إذا كان متاحاً)
+        context = await chromadb_query(text, n_results=2)
+        context_str = "\n".join(context) if context else ""
+
+        # التحليل باستخدام Ollama
+        ollama_result = await audit_with_ollama(text, context_str)
+        if not ollama_result:
+            return JSONResponse(status_code=500, content={"error": "Ollama analysis failed."})
+
+        # تقييم النتيجة مقارنة بالنص المرجعي
+        from src.evaluation import evaluate_analysis
+        eval_metrics = evaluate_analysis(ollama_result, reference_text)
+
+        latency = round(time.time() - start_time, 3)
+
+        # إرجاع النتائج
+        return JSONResponse(content={
+            "analysis": ollama_result,
+            "evaluation": eval_metrics,
+            "latency": f"{latency}s"
+        })
+
+    except Exception as e:
+        logger.error("evaluation_error", error=str(e), exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "Evaluation failed.", "details": str(e)})
+        
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8090)
