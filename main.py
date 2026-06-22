@@ -1,4 +1,5 @@
-import io, re, jwt, datetime, time, json, hashlib, os, logging
+import io, re, jwt, datetime, time, json, hashlib, os
+import structlog
 import httpx
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
@@ -9,24 +10,24 @@ from pydantic_settings import BaseSettings
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, Text, Float, DateTime, select
+from src.logging_config import configure_logging
 
-# --- إعدادات التسجيل ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- إعدادات التسجيل المنظم ---
+configure_logging()
+logger = structlog.get_logger()
 
 # --- إعدادات النظام ---
 class Settings(BaseSettings):
     SECRET_KEY: str = "my_super_secret_key_123"
     GEMINI_API_KEY: str = "your_gemini_key_here"
-    DATABASE_URL: str = "sqlite+aiosqlite:///./platform.db"  # نعود إلى SQLite مؤقتاً
-    OLLAMA_HOST: str = "http://ollama:11434"
+    DATABASE_URL: str = "sqlite+aiosqlite:///./platform.db"
+    OLLAMA_HOST: str = "http://localhost:11434"  # تم التعديل للعمل محلياً
 
 settings = Settings()
 engine = create_async_engine(settings.DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
-# --- تعريف الجدول (مع إصلاح التاريخ) ---
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id = Column(Integer, primary_key=True, index=True)
@@ -35,11 +36,10 @@ class AuditLog(Base):
     risk_level = Column(String(50))
     summary = Column(Text)
     latency = Column(Float)
-    created_at = Column(DateTime, default=lambda: datetime.datetime.utcnow())  # ← إصلاح التاريخ
+    created_at = Column(DateTime, default=lambda: datetime.datetime.utcnow())
 
 app = FastAPI(title="AuditPro Edge Enterprise")
 
-# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,13 +50,14 @@ app.add_middleware(
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# --- دوال ChromaDB عبر HTTP v2 (بدون مكتبة) ---
+# --- دوال ChromaDB ---
 async def chromadb_health() -> bool:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get("http://chromadb:8000/api/v2/heartbeat")
             return resp.status_code == 200
-    except:
+    except Exception as e:
+        logger.error("chromadb_health_check_failed", error=str(e))
         return False
 
 async def chromadb_query(query: str, n_results: int = 3) -> list:
@@ -71,7 +72,7 @@ async def chromadb_query(query: str, n_results: int = 3) -> list:
                 return data.get("documents", [[]])[0]
             return []
     except Exception as e:
-        logger.error(f"ChromaDB query error: {e}")
+        logger.error("chromadb_query_error", error=str(e))
         return []
 
 # --- حدث بدء التشغيل ---
@@ -79,32 +80,29 @@ async def chromadb_query(query: str, n_results: int = 3) -> list:
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    
-    # محاولة إنشاء المجموعة في ChromaDB عبر HTTP v2
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # التحقق من الصحة أولاً
             health = await client.get("http://chromadb:8000/api/v2/heartbeat")
             if health.status_code == 200:
-                logger.info("✅ ChromaDB is reachable")
-                # إنشاء المجموعة
+                logger.info("chromadb_health_check", status="reachable")
                 resp = await client.post(
                     "http://chromadb:8000/api/v2/collections",
                     json={"name": "contracts"}
                 )
                 if resp.status_code in [200, 201]:
-                    logger.info("✅ ChromaDB collection 'contracts' created")
+                    logger.info("chromadb_collection_created", collection="contracts")
                 else:
-                    logger.warning(f"⚠️ Collection creation: {resp.status_code} - {resp.text}")
+                    logger.warning("chromadb_collection_creation_failed", status=resp.status_code, response=resp.text)
             else:
-                logger.warning("⚠️ ChromaDB health check failed")
+                logger.warning("chromadb_health_check_failed", status=health.status_code)
     except Exception as e:
-        logger.warning(f"⚠️ ChromaDB setup error: {e}")
+        logger.warning("chromadb_setup_error", error=str(e))
 
 # --- نقاط النهاية ---
 @app.post("/login")
 async def login():
-    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=8)  # ← إصلاح التاريخ
+    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
     token = jwt.encode({"sub": "admin", "exp": expire}, settings.SECRET_KEY, algorithm="HS256")
     return {"access_token": token, "token_type": "bearer"}
 
@@ -115,7 +113,6 @@ async def get_history():
         logs = result.scalars().all()
         return [{"filename": l.filename, "risk_score": l.risk_score, "date": l.created_at.isoformat()} for l in logs]
 
-# --- دالة تحليل Ollama ---
 async def audit_with_ollama(text: str, context: str = "") -> dict:
     ollama_host = os.getenv("OLLAMA_HOST", settings.OLLAMA_HOST)
     truncated = text[:1500]
@@ -155,7 +152,7 @@ JSON:"""
             if response.status_code == 200:
                 result = response.json()
                 answer = result.get("response", "")
-                logger.info(f"✅ Ollama raw response: {answer[:200]}...")
+                logger.info("ollama_response_received", snippet=answer[:200])
                 
                 try:
                     json_match = re.search(r'(\{.*\})', answer, re.DOTALL)
@@ -179,7 +176,7 @@ JSON:"""
                             "source": "Ollama (Llama3) - Raw"
                         }
                 except json.JSONDecodeError as e:
-                    logger.warning(f"⚠️ JSON parsing failed: {e}")
+                    logger.warning("ollama_json_parse_failed", error=str(e))
                     return {
                         "score": 50,
                         "risk_level": "MEDIUM",
@@ -189,13 +186,12 @@ JSON:"""
                         "source": "Ollama (Llama3) - Raw"
                     }
             else:
-                logger.error(f"❌ Ollama returned {response.status_code}")
+                logger.error("ollama_http_error", status=response.status_code)
                 return None
     except Exception as e:
-        logger.error(f"❌ Ollama error: {e}", exc_info=True)
+        logger.error("ollama_connection_error", error=str(e), exc_info=True)
         return None
 
-# --- دالة التحليل المحلية (احتياطي) ---
 def local_security_audit(text: str) -> dict:
     return {
         "score": 45,
@@ -206,7 +202,6 @@ def local_security_audit(text: str) -> dict:
         "source": "Local-Audit Engine (TinyLlama 1.1B)"
     }
 
-# --- نقطة النهاية الرئيسية ---
 @app.post("/analyze-contract")
 async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oauth2_scheme)):
     start_time = time.time()
@@ -223,7 +218,7 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
                     if page_text:
                         text += page_text + "\n"
         except Exception as e:
-            logger.error(f"PDF extraction error: {e}")
+            logger.error("pdf_extraction_error", error=str(e))
             text = ""
 
         if not text.strip():
@@ -231,24 +226,21 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
             result["summary"] = "No readable text found."
             return {**result, "latency": "0.0s"}
 
-        logger.info(f"📄 Extracted text length: {len(text)} characters")
+        logger.info("pdf_extracted", filename=file.filename, length=len(text))
 
-        # استرجاع سياق من ChromaDB
         context = await chromadb_query(text, n_results=2)
         context_str = "\n".join(context) if context else ""
 
-        # التحليل باستخدام Ollama
         ollama_result = await audit_with_ollama(text, context_str)
         if ollama_result:
             result = ollama_result
-            logger.info(f"🤖 Analysis source: {result.get('source')}")
+            logger.info("analysis_completed", source=result.get('source'))
         else:
             result = local_security_audit(text)
-            logger.info(f"⚠️ Using fallback")
+            logger.info("analysis_fallback_used", source=result.get('source'))
 
         latency = round(time.time() - start_time, 3)
 
-        # حفظ في قاعدة البيانات
         async with async_session() as session:
             new_log = AuditLog(
                 filename=file.filename,
@@ -256,7 +248,6 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
                 risk_level=result["risk_level"],
                 summary=result["summary"],
                 latency=latency
-                # created_at سيتم تعيينها تلقائياً بواسطة default
             )
             session.add(new_log)
             await session.commit()
@@ -264,7 +255,7 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
         return {**result, "latency": f"{latency}s"}
 
     except Exception as e:
-        logger.error(f"🔥 Unhandled error: {e}", exc_info=True)
+        logger.error("unhandled_exception", error=str(e), exc_info=True)
         return JSONResponse(status_code=500, content={"error": "Internal server error", "details": str(e)})
 
 if __name__ == "__main__":
