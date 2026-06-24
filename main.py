@@ -30,6 +30,9 @@ engine = create_async_engine(settings.DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
+# متغير بيئي لـ ChromaDB (يعمل داخل Docker ومحلياً)
+CHROMA_HOST = os.getenv("CHROMA_HOST", "http://localhost:8000")
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id = Column(Integer, primary_key=True, index=True)
@@ -38,7 +41,7 @@ class AuditLog(Base):
     risk_level = Column(String(50))
     summary = Column(Text)
     latency = Column(Float)
-    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.datetime.utcnow())  # ← إصلاح التاريخ
 
 app = FastAPI(title="AuditPro Edge Enterprise")
 
@@ -70,11 +73,11 @@ async def metrics_middleware(request: Request, call_next):
         ERROR_COUNT.labels(method=request.method, endpoint=request.url.path, error_type=str(response.status_code)).inc()
     return response
 
-# --- دوال ChromaDB (API v1) ---
+# --- دوال ChromaDB (API v1) باستخدام CHROMA_HOST ---
 async def chromadb_health() -> bool:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get("http://localhost:8000/api/v1/heartbeat")
+            resp = await client.get(f"{CHROMA_HOST}/api/v1/heartbeat")
             return resp.status_code == 200
     except Exception as e:
         logger.error("chromadb_health_check_failed", error=str(e))
@@ -84,7 +87,7 @@ async def chromadb_query(query: str, n_results: int = 3) -> list:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                "http://localhost:8000/api/v1/collections/contracts/query",
+                f"{CHROMA_HOST}/api/v1/collections/contracts/query",
                 json={"query_texts": [query], "n_results": n_results}
             )
             if resp.status_code == 200:
@@ -103,11 +106,11 @@ async def startup():
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            health = await client.get("http://localhost:8000/api/v1/heartbeat")
+            health = await client.get(f"{CHROMA_HOST}/api/v1/heartbeat")
             if health.status_code == 200:
                 logger.info("chromadb_health_check", status="reachable")
                 resp = await client.post(
-                    "http://localhost:8000/api/v1/collections",
+                    f"{CHROMA_HOST}/api/v1/collections",
                     json={"name": "contracts"}
                 )
                 if resp.status_code in [200, 201]:
@@ -122,7 +125,7 @@ async def startup():
 # --- نقاط النهاية ---
 @app.post("/login")
 async def login():
-    expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=8)  # ← إصلاح التاريخ
     token = jwt.encode({"sub": "admin", "exp": expire}, settings.SECRET_KEY, algorithm="HS256")
     return {"access_token": token, "token_type": "bearer"}
 
@@ -131,7 +134,55 @@ async def get_history():
     async with async_session() as session:
         result = await session.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(20))
         logs = result.scalars().all()
-        return [{"filename": l.filename, "risk_score": l.risk_score, "date": l.created_at.isoformat()} for l in logs]
+        return [{"id": l.id, "filename": l.filename, "risk_score": l.risk_score, "date": l.created_at.isoformat()} for l in logs]
+
+@app.get("/history/{log_id}")
+async def get_audit_by_id(log_id: int, token: str = Depends(oauth2_scheme)):
+    async with async_session() as session:
+        log = await session.get(AuditLog, log_id)
+        if not log:
+            raise HTTPException(status_code=404, detail="Audit not found")
+        return {
+            "id": log.id,
+            "filename": log.filename,
+            "risk_score": log.risk_score,
+            "risk_level": log.risk_level,
+            "summary": log.summary,
+            "latency": log.latency,
+            "created_at": log.created_at.isoformat()
+        }
+
+@app.post("/chat")
+async def chat_with_contract(
+    message: str = Form(...),
+    context: str = Form(...),
+    token: str = Depends(oauth2_scheme)
+):
+    try:
+        ollama_host = os.getenv("OLLAMA_HOST", settings.OLLAMA_HOST)
+        truncated_context = context[:2000]
+        prompt = f"""You are a legal AI assistant. Given the following contract context and analysis, answer the user's question.
+        
+Contract Context: {truncated_context}
+
+User Question: {message}
+
+Provide a clear and concise answer."""
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{ollama_host}/api/generate",
+                json={"model": "llama3", "prompt": prompt, "stream": False}
+            )
+            if response.status_code == 200:
+                reply = response.json().get("response", "")
+                logger.info("chat_response_generated", snippet=reply[:200])
+                return {"response": reply}
+            else:
+                logger.error("chat_ollama_error", status=response.status_code)
+                return {"response": "Sorry, I couldn't process your question."}
+    except Exception as e:
+        logger.error("chat_error", error=str(e), exc_info=True)
+        return {"response": "An error occurred while processing your request."}
 
 async def audit_with_ollama(text: str, context: str = "") -> dict:
     ollama_host = os.getenv("OLLAMA_HOST", settings.OLLAMA_HOST)
@@ -283,7 +334,6 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
 # ============================================
 @app.get("/health")
 async def health_check():
-    """التحقق من صحة الخدمات الأساسية"""
     status = {"status": "healthy", "services": {}}
     
     try:
@@ -315,18 +365,14 @@ async def health_check():
 
 @app.get("/metrics")
 async def metrics():
-    """نقطة نهاية لمقاييس Prometheus"""
     return Response(content=generate_latest(REGISTRY), media_type="text/plain")
 
 @app.post("/evaluate")
 async def evaluate_contract(
     file: UploadFile = File(...),
-    reference_text: str = Form(...),  # النص المرجعي للمقارنة
+    reference_text: str = Form(...),
     token: str = Depends(oauth2_scheme)
 ):
-    """
-    تحليل عقد وتقييم جودة المخرجات مقارنة بنص مرجعي.
-    """
     start_time = time.time()
     try:
         if not file.filename.lower().endswith('.pdf'):
@@ -347,22 +393,18 @@ async def evaluate_contract(
         if not text.strip():
             return JSONResponse(status_code=400, content={"error": "No text found in PDF."})
 
-        # استرجاع السياق من ChromaDB (إذا كان متاحاً)
         context = await chromadb_query(text, n_results=2)
         context_str = "\n".join(context) if context else ""
 
-        # التحليل باستخدام Ollama
         ollama_result = await audit_with_ollama(text, context_str)
         if not ollama_result:
             return JSONResponse(status_code=500, content={"error": "Ollama analysis failed."})
 
-        # تقييم النتيجة مقارنة بالنص المرجعي
         from src.evaluation import evaluate_analysis
         eval_metrics = evaluate_analysis(ollama_result, reference_text)
 
         latency = round(time.time() - start_time, 3)
 
-        # إرجاع النتائج
         return JSONResponse(content={
             "analysis": ollama_result,
             "evaluation": eval_metrics,

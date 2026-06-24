@@ -1,7 +1,4 @@
 services:
-  # ============================================
-  # 1. الذكاء الاصطناعي المحلي (Ollama)
-  # ============================================
   ollama:
     image: ollama/ollama:latest
     ports:
@@ -21,9 +18,6 @@ services:
     networks:
       - audit_network
 
-  # ============================================
-  # 2. قاعدة البيانات العلائقية (PostgreSQL)
-  # ============================================
   postgres:
     image: postgres:15
     environment:
@@ -44,9 +38,6 @@ services:
       - audit_network
     restart: unless-stopped
 
-  # ============================================
-  # 3. قاعدة بيانات المتجهات (ChromaDB) – RAG
-  # ============================================
   chromadb:
     image: chromadb/chroma:latest
     ports:
@@ -57,7 +48,7 @@ services:
       - IS_PERSISTENT=TRUE
       - PERSIST_DIRECTORY=/chroma/chroma
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8000/api/v2/heartbeat"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -66,20 +57,31 @@ services:
       - audit_network
     restart: unless-stopped
 
-  # ============================================
-  # 4. الخلفية (FastAPI) – مع دعم PostgreSQL و ChromaDB
-  # ============================================
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - audit_network
+    restart: unless-stopped
+
   backend:
     build: .
     ports:
       - "8090:8090"
     environment:
       - OLLAMA_HOST=http://ollama:11434
+      - CHROMA_HOST=http://chromadb:8000           # ← تمت الإضافة
       - SECRET_KEY=my_super_secret_key_123
       - GEMINI_API_KEY=your_gemini_key_here
       - DATABASE_URL=postgresql+asyncpg://audituser:securepassword123@postgres:5432/auditpro
       - REDIS_URL=redis://redis:6379
-      - CHROMA_HOST=http://localhost:8000
     depends_on:
       - ollama
       - postgres
@@ -99,9 +101,6 @@ services:
       - audit_network
     restart: unless-stopped
 
-  # ============================================
-  # 5. الواجهة الأمامية (Next.js)
-  # ============================================
   frontend:
     image: node:22-slim
     working_dir: /app
@@ -111,7 +110,7 @@ services:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_API_URL=http://localhost:8090
-    command: sh -c "npm install && npm run dev -- --hostname 0.0.0.0"
+    command: sh -c "npm install && npm run build && npm run start"
     depends_on:
       - backend
     healthcheck:
@@ -124,33 +123,10 @@ services:
       - audit_network
     restart: unless-stopped
 
-  # ============================================
-  # 6. Redis – تخزين مؤقت (جلسات، مهام)
-  # ============================================
-  redis:
-    image: redis:alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 10s
-    networks:
-      - audit_network
-    restart: unless-stopped
-
-# ============================================
-# الشبكة المخصصة لعزل الخدمات
-# ============================================
 networks:
   audit_network:
     driver: bridge
 
-# ============================================
-# وحدات التخزين الدائمة
-# ============================================
 volumes:
   ollama_data:
   postgres_data:
