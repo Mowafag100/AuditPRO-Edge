@@ -69,11 +69,17 @@ TOKEN=$(curl -s -X POST http://localhost:8090/login | python3 -c "import sys, js
 # تحليل ملف PDF
 curl -X POST http://localhost:8090/analyze-contract \
   -H "Authorization: Bearer $TOKEN" \
-  -F "file=@your_contract.pdf"
-📷 لقطات الشاشة
-<img width="956" height="535" alt="لقطة شاشة 2026-06-25 015143" src="https://github.com/user-attachments/assets/31bb3299-ba5f-40d4-bec3-02587cb59ffb" />
-<img width="958" height="536" alt="لقطة شاشة 2026-06-25 015128" src="https://github.com/user-attachments/assets/80554f3e-04e6-401a-b0ae-84f696b1f5bc" />
+  -F "file=@your_contract.pdf"## 📷 لقطات الشاشة
 
+<div align="center">
+  <h3>🏠 الواجهة الرئيسية ورفع الملفات</h3>
+  <img width="80%" alt="لقطة شاشة 2026-06-25 015143" src="https://github.com/user-attachments/assets/31bb3299-ba5f-40d4-bec3-02587cb59ffb" />
+  <br/><br/>
+  <h3>📊 نتائج التحليل ومقياس المخاطر</h3>
+  <img width="80%" alt="لقطة شاشة 2026-06-25 015128" src="https://github.com/user-attachments/assets/80554f3e-04e6-401a-b0ae-84f696b1f5bc" />
+  <br/><br/>
+  <p><em>تحليل العقد الذكي مع عرض المخاطر والتوصيات والشات التفاعلي</em></p>
+</div>
 
 يُرجى إضافة صور توضيحية هنا (سأرفقها لاحقاً).
 
