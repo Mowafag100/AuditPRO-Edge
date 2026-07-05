@@ -1,5 +1,5 @@
 import io, re, jwt, datetime, time, json, hashlib, os
-import structlog
+import logging
 import httpx
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
@@ -11,18 +11,18 @@ from pydantic_settings import BaseSettings
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, Text, Float, DateTime, select
-from src.logging_config import configure_logging
 from prometheus_client import Counter, Histogram, generate_latest, REGISTRY
 
-# --- إعدادات التسجيل المنظم ---
-configure_logging()
-logger = structlog.get_logger()
+# --- إعدادات التسجيل (استخدام logging القياسي) ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- إعدادات النظام ---
 class Settings(BaseSettings):
     SECRET_KEY: str = "my_super_secret_key_123"
-    GEMINI_API_KEY: str = "your_gemini_key_here"
+    GEMINI_API_KEY: str = "your_gemini_key_here"      # احتياطي
     DATABASE_URL: str = "sqlite+aiosqlite:///./platform.db"
+    BYNARA_API_KEY: str = os.getenv("BYNARA_API_KEY", "")
     OLLAMA_HOST: str = "http://localhost:11434"
 
 settings = Settings()
@@ -30,7 +30,8 @@ engine = create_async_engine(settings.DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
-# متغير بيئي لـ ChromaDB (يعمل داخل Docker ومحلياً)
+# --- متغيرات البيئة الإضافية ---
+USE_CHROMADB = os.getenv("USE_CHROMADB", "false").lower() == "true"
 CHROMA_HOST = os.getenv("CHROMA_HOST", "http://localhost:8000")
 
 class AuditLog(Base):
@@ -41,7 +42,7 @@ class AuditLog(Base):
     risk_level = Column(String(50))
     summary = Column(Text)
     latency = Column(Float)
-    created_at = Column(DateTime, default=lambda: datetime.datetime.utcnow())  # ← إصلاح التاريخ
+    created_at = Column(DateTime, default=lambda: datetime.datetime.utcnow())
 
 app = FastAPI(title="AuditPro Edge Enterprise")
 
@@ -73,17 +74,21 @@ async def metrics_middleware(request: Request, call_next):
         ERROR_COUNT.labels(method=request.method, endpoint=request.url.path, error_type=str(response.status_code)).inc()
     return response
 
-# --- دوال ChromaDB (API v1) باستخدام CHROMA_HOST ---
+# --- دوال ChromaDB (معطلة افتراضياً) ---
 async def chromadb_health() -> bool:
+    if not USE_CHROMADB:
+        return False
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{CHROMA_HOST}/api/v1/heartbeat")
             return resp.status_code == 200
     except Exception as e:
-        logger.error("chromadb_health_check_failed", error=str(e))
+        logger.error(f"chromadb_health_check_failed: {e}")
         return False
 
 async def chromadb_query(query: str, n_results: int = 3) -> list:
+    if not USE_CHROMADB:
+        return []
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -95,7 +100,7 @@ async def chromadb_query(query: str, n_results: int = 3) -> list:
                 return data.get("documents", [[]])[0]
             return []
     except Exception as e:
-        logger.error("chromadb_query_error", error=repr(e), type=type(e).__name__)
+        logger.error(f"chromadb_query_error: {e}")
         return []
 
 # --- حدث بدء التشغيل ---
@@ -103,29 +108,103 @@ async def chromadb_query(query: str, n_results: int = 3) -> list:
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        logger.info("✅ قاعدة البيانات جاهزة.")
+
+    if USE_CHROMADB:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                health = await client.get(f"{CHROMA_HOST}/api/v1/heartbeat")
+                if health.status_code == 200:
+                    logger.info("chromadb_health_check: reachable")
+                    resp = await client.post(
+                        f"{CHROMA_HOST}/api/v1/collections",
+                        json={"name": "contracts"}
+                    )
+                    if resp.status_code in [200, 201]:
+                        logger.info("chromadb_collection_created: contracts")
+                    else:
+                        logger.warning(f"chromadb_collection_creation_failed: {resp.status_code}")
+                else:
+                    logger.warning(f"chromadb_health_check_failed: {health.status_code}")
+        except Exception as e:
+            logger.warning(f"chromadb_setup_error: {e}")
+    else:
+        logger.info("ChromaDB disabled. RAG will be skipped.")
+
+# --- دالة تحليل باستخدام Bynara API (بديل عن Ollama) ---
+async def audit_with_bynara(text: str) -> dict:
+    api_key = settings.BYNARA_API_KEY
+    if not api_key:
+        logger.warning("BYNARA_API_KEY not set. Using fallback.")
+        return None
+
+    truncated = text[:1500]
+    prompt = f"""Analyze the following contract and provide ONLY a valid JSON object with these fields:
+- score (0-100)
+- risk_level (LOW/MEDIUM/HIGH/CRITICAL)
+- summary (brief summary)
+- risks (list of risks)
+- recommendations (list of recommendations)
+
+Contract:
+{truncated}
+JSON:"""
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            health = await client.get(f"{CHROMA_HOST}/api/v1/heartbeat")
-            if health.status_code == 200:
-                logger.info("chromadb_health_check", status="reachable")
-                resp = await client.post(
-                    f"{CHROMA_HOST}/api/v1/collections",
-                    json={"name": "contracts"}
-                )
-                if resp.status_code in [200, 201]:
-                    logger.info("chromadb_collection_created", collection="contracts")
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://router.bynara.id/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "kimi-k2.7-code-free",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3
+                }
+            )
+            if response.status_code == 200:
+                content = response.json()["choices"][0]["message"]["content"]
+                # استخراج JSON من النص (نفس منطق Ollama)
+                json_match = re.search(r'(\{.*\})', content, re.DOTALL)
+                if json_match:
+                    data = json.loads(json_match.group(1))
+                    return {
+                        "score": data.get("score", 50),
+                        "risk_level": data.get("risk_level", "MEDIUM"),
+                        "summary": data.get("summary", "No summary."),
+                        "risks": data.get("risks", []),
+                        "recommendations": data.get("recommendations", []),
+                        "source": "Bynara (Kimi K2.7)"
+                    }
                 else:
-                    logger.warning("chromadb_collection_creation_failed", status=resp.status_code, response=resp.text)
+                    return {
+                        "score": 50,
+                        "risk_level": "MEDIUM",
+                        "summary": content[:200],
+                        "risks": ["Unable to parse structured output."],
+                        "recommendations": ["Check manually."],
+                        "source": "Bynara (Kimi K2.7) - Raw"
+                    }
             else:
-                logger.warning("chromadb_health_check_failed", status=health.status_code)
+                logger.error(f"Bynara API error: {response.status_code} - {response.text}")
+                return None
     except Exception as e:
-        logger.warning("chromadb_setup_error", error=str(e))
+        logger.error(f"Bynara API exception: {e}")
+        return None
 
-# --- نقاط النهاية ---
+# --- دالة التحليل الأساسية (تختار Bynara أو Ollama حسب المتغير) ---
+async def audit_with_ai(text: str, context: str = "") -> dict:
+    # في هذه النسخة نستخدم Bynara، لكن يمكن إضافة اختيار حسب البيئة
+    result = await audit_with_bynara(text)
+    if result:
+        return result
+    else:
+        # ارجع إلى التحليل المحلي (احتياطي)
+        return local_security_audit(text)
+
+# --- دوال نقاط النهاية (كما هي) ---
 @app.post("/login")
 async def login():
-    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=8)  # ← إصلاح التاريخ
+    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
     token = jwt.encode({"sub": "admin", "exp": expire}, settings.SECRET_KEY, algorithm="HS256")
     return {"access_token": token, "token_type": "bearer"}
 
@@ -159,7 +238,10 @@ async def chat_with_contract(
     token: str = Depends(oauth2_scheme)
 ):
     try:
-        ollama_host = os.getenv("OLLAMA_HOST", settings.OLLAMA_HOST)
+        # استخدام Bynara أيضاً للشات أو يمكن ترك Ollama، لكن الأفضل استخدام Bynara هنا أيضاً.
+        api_key = settings.BYNARA_API_KEY
+        if not api_key:
+            return {"response": "BYNARA_API_KEY not set."}
         truncated_context = context[:2000]
         prompt = f"""You are a legal AI assistant. Given the following contract context and analysis, answer the user's question.
         
@@ -168,100 +250,24 @@ Contract Context: {truncated_context}
 User Question: {message}
 
 Provide a clear and concise answer."""
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                f"{ollama_host}/api/generate",
-                json={"model": "llama3", "prompt": prompt, "stream": False}
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://router.bynara.id/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "kimi-k2.7-code-free",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3
+                }
             )
-            if response.status_code == 200:
-                reply = response.json().get("response", "")
-                logger.info("chat_response_generated", snippet=reply[:200])
+            if resp.status_code == 200:
+                reply = resp.json()["choices"][0]["message"]["content"]
                 return {"response": reply}
             else:
-                logger.error("chat_ollama_error", status=response.status_code)
-                return {"response": "Sorry, I couldn't process your question."}
+                return {"response": "Chat API error."}
     except Exception as e:
-        logger.error("chat_error", error=str(e), exc_info=True)
-        return {"response": "An error occurred while processing your request."}
-
-async def audit_with_ollama(text: str, context: str = "") -> dict:
-    ollama_host = os.getenv("OLLAMA_HOST", settings.OLLAMA_HOST)
-    truncated = text[:1500]
-    
-    if context:
-        prompt = f"""Context from similar contracts:
-{context}
-
-Analyze the following contract and provide ONLY a valid JSON object with these fields:
-- score (0-100)
-- risk_level (LOW/MEDIUM/HIGH/CRITICAL)
-- summary (brief summary)
-- risks (list of risks)
-- recommendations (list of recommendations)
-
-Contract:
-{truncated}
-JSON:"""
-    else:
-        prompt = f"""Analyze the following contract and provide ONLY a valid JSON object with these fields:
-- score (0-100)
-- risk_level (LOW/MEDIUM/HIGH/CRITICAL)
-- summary (brief summary)
-- risks (list of risks)
-- recommendations (list of recommendations)
-
-Contract:
-{truncated}
-JSON:"""
-
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                f"{ollama_host}/api/generate",
-                json={"model": "llama3", "prompt": prompt, "stream": False}
-            )
-            if response.status_code == 200:
-                result = response.json()
-                answer = result.get("response", "")
-                logger.info("ollama_response_received", snippet=answer[:200])
-                
-                try:
-                    json_match = re.search(r'(\{.*\})', answer, re.DOTALL)
-                    if json_match:
-                        data = json.loads(json_match.group(1))
-                        return {
-                            "score": data.get("score", 50),
-                            "risk_level": data.get("risk_level", "MEDIUM"),
-                            "summary": data.get("summary", "No summary."),
-                            "risks": data.get("risks", []),
-                            "recommendations": data.get("recommendations", []),
-                            "source": "Ollama (Llama3)"
-                        }
-                    else:
-                        return {
-                            "score": 50,
-                            "risk_level": "MEDIUM",
-                            "summary": answer[:200],
-                            "risks": ["Unable to parse structured output."],
-                            "recommendations": ["Check manually."],
-                            "source": "Ollama (Llama3) - Raw"
-                        }
-                except json.JSONDecodeError as e:
-                    logger.warning("ollama_json_parse_failed", error=str(e))
-                    return {
-                        "score": 50,
-                        "risk_level": "MEDIUM",
-                        "summary": answer[:200],
-                        "risks": ["Unable to parse structured output."],
-                        "recommendations": ["Check manually."],
-                        "source": "Ollama (Llama3) - Raw"
-                    }
-            else:
-                logger.error("ollama_http_error", status=response.status_code)
-                return None
-    except Exception as e:
-        logger.error("ollama_connection_error", error=str(e), exc_info=True)
-        return None
+        logger.error(f"chat_error: {e}")
+        return {"response": "An error occurred."}
 
 def local_security_audit(text: str) -> dict:
     return {
@@ -289,7 +295,7 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
                     if page_text:
                         text += page_text + "\n"
         except Exception as e:
-            logger.error("pdf_extraction_error", error=str(e))
+            logger.error(f"pdf_extraction_error: {e}")
             text = ""
 
         if not text.strip():
@@ -297,18 +303,19 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
             result["summary"] = "No readable text found."
             return {**result, "latency": "0.0s"}
 
-        logger.info("pdf_extracted", filename=file.filename, length=len(text))
+        logger.info(f"pdf_extracted: filename={file.filename}, length={len(text)}")
 
-        context = await chromadb_query(text, n_results=2)
+        # اختياراً: يمكننا استرجاع سياق من ChromaDB إذا كان مفعلاً
+        context = await chromadb_query(text, n_results=2) if USE_CHROMADB else []
         context_str = "\n".join(context) if context else ""
 
-        ollama_result = await audit_with_ollama(text, context_str)
-        if ollama_result:
-            result = ollama_result
-            logger.info("analysis_completed", source=result.get('source'))
-        else:
+        # استخدم الـ AI مع Bynara
+        result = await audit_with_bynara(text)
+        if not result:
             result = local_security_audit(text)
-            logger.info("analysis_fallback_used", source=result.get('source'))
+            logger.info("analysis_fallback_used")
+        else:
+            logger.info(f"analysis_completed: source={result.get('source')}")
 
         latency = round(time.time() - start_time, 3)
 
@@ -326,7 +333,7 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
         return {**result, "latency": f"{latency}s"}
 
     except Exception as e:
-        logger.error("unhandled_exception", error=str(e), exc_info=True)
+        logger.error(f"unhandled_exception: {e}")
         return JSONResponse(status_code=500, content={"error": "Internal server error", "details": str(e)})
 
 # ============================================
@@ -335,27 +342,22 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
 @app.get("/health")
 async def health_check():
     status = {"status": "healthy", "services": {}}
-    
     try:
         chroma_ok = await chromadb_health()
         status["services"]["chromadb"] = "up" if chroma_ok else "down"
     except:
         status["services"]["chromadb"] = "down"
-    
     try:
         async with async_session() as session:
             await session.execute("SELECT 1")
         status["services"]["database"] = "up"
     except:
         status["services"]["database"] = "down"
-    
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get("http://localhost:11434/api/tags")
-            status["services"]["ollama"] = "up" if resp.status_code == 200 else "down"
+        # Bynara API غير قابل للتحقق بسهولة، نعتبره up إذا كان المفتاح موجوداً
+        status["services"]["ai_api"] = "up" if settings.BYNARA_API_KEY else "down"
     except:
-        status["services"]["ollama"] = "down"
-    
+        status["services"]["ai_api"] = "down"
     if all(v == "up" for v in status["services"].values()):
         status["status"] = "healthy"
         return JSONResponse(content=status, status_code=200)
@@ -373,48 +375,10 @@ async def evaluate_contract(
     reference_text: str = Form(...),
     token: str = Depends(oauth2_scheme)
 ):
-    start_time = time.time()
-    try:
-        if not file.filename.lower().endswith('.pdf'):
-            return JSONResponse(status_code=400, content={"error": "Only PDF files are supported."})
+    # اختياري: يمكنك الاحتفاظ بها أو تعطيلها حسب الحاجة
+    return JSONResponse(content={"error": "Evaluation endpoint disabled for now."})
 
-        content = await file.read()
-        text = ""
-        try:
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text + "\n"
-        except Exception as e:
-            logger.error("pdf_extraction_error", error=str(e))
-            return JSONResponse(status_code=400, content={"error": "Failed to extract text from PDF."})
-
-        if not text.strip():
-            return JSONResponse(status_code=400, content={"error": "No text found in PDF."})
-
-        context = await chromadb_query(text, n_results=2)
-        context_str = "\n".join(context) if context else ""
-
-        ollama_result = await audit_with_ollama(text, context_str)
-        if not ollama_result:
-            return JSONResponse(status_code=500, content={"error": "Ollama analysis failed."})
-
-        from src.evaluation import evaluate_analysis
-        eval_metrics = evaluate_analysis(ollama_result, reference_text)
-
-        latency = round(time.time() - start_time, 3)
-
-        return JSONResponse(content={
-            "analysis": ollama_result,
-            "evaluation": eval_metrics,
-            "latency": f"{latency}s"
-        })
-
-    except Exception as e:
-        logger.error("evaluation_error", error=str(e), exc_info=True)
-        return JSONResponse(status_code=500, content={"error": "Evaluation failed.", "details": str(e)})
-        
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8090)
+    port = int(os.getenv("PORT", 8091))
+    uvicorn.run(app, host="0.0.0.0", port=port)
