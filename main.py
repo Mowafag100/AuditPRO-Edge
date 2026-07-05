@@ -1,4 +1,4 @@
-import io, re, jwt, datetime, time, json, hashlib, os
+import io, re, jwt, datetime, time, json, hashlib, os, uuid
 import logging
 import httpx
 from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, Request
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # --- إعدادات النظام ---
 class Settings(BaseSettings):
     SECRET_KEY: str = "my_super_secret_key_123"
-    GEMINI_API_KEY: str = "your_gemini_key_here"      # احتياطي
+    GEMINI_API_KEY: str = "your_gemini_key_here"
     DATABASE_URL: str = "sqlite+aiosqlite:///./platform.db"
     BYNARA_API_KEY: str = os.getenv("BYNARA_API_KEY", "")
     OLLAMA_HOST: str = "http://localhost:11434"
@@ -43,6 +43,7 @@ class AuditLog(Base):
     summary = Column(Text)
     latency = Column(Float)
     created_at = Column(DateTime, default=lambda: datetime.datetime.utcnow())
+    user_id = Column(String(36), nullable=True)  # عمود جديد لتخزين معرف المستخدم
 
 app = FastAPI(title="AuditPro Edge Enterprise")
 
@@ -107,6 +108,7 @@ async def chromadb_query(query: str, n_results: int = 3) -> list:
 @app.on_event("startup")
 async def startup():
     async with engine.begin() as conn:
+        # تحديث الجداول (يضيف عمود user_id تلقائياً إذا لم يكن موجوداً)
         await conn.run_sync(Base.metadata.create_all)
         logger.info("✅ قاعدة البيانات جاهزة.")
 
@@ -163,7 +165,6 @@ JSON:"""
             )
             if response.status_code == 200:
                 content = response.json()["choices"][0]["message"]["content"]
-                # استخراج JSON من النص (نفس منطق Ollama)
                 json_match = re.search(r'(\{.*\})', content, re.DOTALL)
                 if json_match:
                     data = json.loads(json_match.group(1))
@@ -191,35 +192,54 @@ JSON:"""
         logger.error(f"Bynara API exception: {e}")
         return None
 
-# --- دالة التحليل الأساسية (تختار Bynara أو Ollama حسب المتغير) ---
-async def audit_with_ai(text: str, context: str = "") -> dict:
-    # في هذه النسخة نستخدم Bynara، لكن يمكن إضافة اختيار حسب البيئة
-    result = await audit_with_bynara(text)
-    if result:
-        return result
-    else:
-        # ارجع إلى التحليل المحلي (احتياطي)
-        return local_security_audit(text)
+def local_security_audit(text: str) -> dict:
+    return {
+        "score": 45,
+        "risk_level": "MEDIUM",
+        "summary": "Local analysis executed due to connection fallback.",
+        "risks": ["Standard contract clauses detected."],
+        "recommendations": ["Review by legal counsel."],
+        "source": "Local-Audit Engine (TinyLlama 1.1B)"
+    }
 
-# --- دوال نقاط النهاية (كما هي) ---
+# --- دوال نقاط النهاية ---
 @app.post("/login")
 async def login():
+    user_id = str(uuid.uuid4())  # معرف فريد لكل جلسة
     expire = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-    token = jwt.encode({"sub": "admin", "exp": expire}, settings.SECRET_KEY, algorithm="HS256")
+    token = jwt.encode({"sub": user_id, "exp": expire}, settings.SECRET_KEY, algorithm="HS256")
     return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/history")
-async def get_history():
+async def get_history(token: str = Depends(oauth2_scheme)):
+    # فك التوكن للحصول على user_id
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        user_id = payload.get("sub")
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     async with async_session() as session:
-        result = await session.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(20))
+        result = await session.execute(
+            select(AuditLog)
+            .where(AuditLog.user_id == user_id)
+            .order_by(AuditLog.created_at.desc())
+            .limit(20)
+        )
         logs = result.scalars().all()
         return [{"id": l.id, "filename": l.filename, "risk_score": l.risk_score, "date": l.created_at.isoformat()} for l in logs]
 
 @app.get("/history/{log_id}")
 async def get_audit_by_id(log_id: int, token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        user_id = payload.get("sub")
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     async with async_session() as session:
         log = await session.get(AuditLog, log_id)
-        if not log:
+        if not log or log.user_id != user_id:
             raise HTTPException(status_code=404, detail="Audit not found")
         return {
             "id": log.id,
@@ -238,13 +258,12 @@ async def chat_with_contract(
     token: str = Depends(oauth2_scheme)
 ):
     try:
-        # استخدام Bynara أيضاً للشات أو يمكن ترك Ollama، لكن الأفضل استخدام Bynara هنا أيضاً.
         api_key = settings.BYNARA_API_KEY
         if not api_key:
             return {"response": "BYNARA_API_KEY not set."}
         truncated_context = context[:2000]
         prompt = f"""You are a legal AI assistant. Given the following contract context and analysis, answer the user's question.
-        
+
 Contract Context: {truncated_context}
 
 User Question: {message}
@@ -269,18 +288,18 @@ Provide a clear and concise answer."""
         logger.error(f"chat_error: {e}")
         return {"response": "An error occurred."}
 
-def local_security_audit(text: str) -> dict:
-    return {
-        "score": 45,
-        "risk_level": "MEDIUM",
-        "summary": "Local analysis executed due to connection fallback.",
-        "risks": ["Standard contract clauses detected."],
-        "recommendations": ["Review by legal counsel."],
-        "source": "Local-Audit Engine (TinyLlama 1.1B)"
-    }
-
 @app.post("/analyze-contract")
-async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oauth2_scheme)):
+async def analyze_contract(
+    file: UploadFile = File(...),
+    token: str = Depends(oauth2_scheme)
+):
+    # فك التوكن للحصول على user_id
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        user_id = payload.get("sub")
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     start_time = time.time()
     try:
         if not file.filename.lower().endswith('.pdf'):
@@ -305,11 +324,9 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
 
         logger.info(f"pdf_extracted: filename={file.filename}, length={len(text)}")
 
-        # اختياراً: يمكننا استرجاع سياق من ChromaDB إذا كان مفعلاً
         context = await chromadb_query(text, n_results=2) if USE_CHROMADB else []
         context_str = "\n".join(context) if context else ""
 
-        # استخدم الـ AI مع Bynara
         result = await audit_with_bynara(text)
         if not result:
             result = local_security_audit(text)
@@ -325,7 +342,8 @@ async def analyze_contract(file: UploadFile = File(...), token: str = Depends(oa
                 risk_score=result["score"],
                 risk_level=result["risk_level"],
                 summary=result["summary"],
-                latency=latency
+                latency=latency,
+                user_id=user_id  # ربط التحليل بالمستخدم
             )
             session.add(new_log)
             await session.commit()
@@ -354,7 +372,6 @@ async def health_check():
     except:
         status["services"]["database"] = "down"
     try:
-        # Bynara API غير قابل للتحقق بسهولة، نعتبره up إذا كان المفتاح موجوداً
         status["services"]["ai_api"] = "up" if settings.BYNARA_API_KEY else "down"
     except:
         status["services"]["ai_api"] = "down"
@@ -375,7 +392,6 @@ async def evaluate_contract(
     reference_text: str = Form(...),
     token: str = Depends(oauth2_scheme)
 ):
-    # اختياري: يمكنك الاحتفاظ بها أو تعطيلها حسب الحاجة
     return JSONResponse(content={"error": "Evaluation endpoint disabled for now."})
 
 if __name__ == "__main__":
