@@ -375,6 +375,19 @@ Latency: ${analysis.latency || 'N/A'}
             </div>
           </div>
         </main>
+        
+        {/* ===== تذييل الصفحة – بصمة المهندس ===== */}
+        <footer className="mt-12 border-t border-zinc-800 pt-4 text-left">
+          <p className="text-xs text-zinc-500">
+            Developed by{' '}
+            <span className="text-emerald-400 font-semibold tracking-wide">
+              Mowafag Fawzy
+            </span>
+            <span className="mx-2 text-zinc-700">|</span>
+            <span className="text-zinc-600">© {new Date().getFullYear()} All rights reserved.</span>
+          </p>
+        </footer>
+
       </div>
     </div>
   );
